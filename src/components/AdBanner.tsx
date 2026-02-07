@@ -1,10 +1,22 @@
-import React from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import React, { useState } from 'react';
+import { View, StyleSheet } from 'react-native';
+import { BannerAd, BannerAdSize } from 'react-native-google-mobile-ads';
+import { AdConfig } from '../config/admob';
 
-export default function AdBanner() {
+export default function AdBanner({ unitId }: { unitId?: string }) {
+    // TODO: Add error handling visually if needed, for now just log
     return (
         <View style={styles.container}>
-            <Text style={styles.text}>広告バナー (開発用プレースホルダー)</Text>
+            <BannerAd
+                unitId={unitId || AdConfig.bannerTopAdUnitId} // Fallback? Or better to require it. Let's fallback to Top for safety.
+                size={BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
+                requestOptions={{
+                    requestNonPersonalizedAdsOnly: true,
+                }}
+                onAdFailedToLoad={(error) => {
+                    console.warn('BannerAd failed to load', error);
+                }}
+            />
         </View>
     );
 }
@@ -12,14 +24,8 @@ export default function AdBanner() {
 const styles = StyleSheet.create({
     container: {
         width: '100%',
-        height: 60,
-        backgroundColor: '#333',
-        justifyContent: 'center',
         alignItems: 'center',
-    },
-    text: {
-        color: '#aaa',
-        fontSize: 12,
-        fontWeight: 'bold',
+        justifyContent: 'center',
+        marginVertical: 10,
     },
 });

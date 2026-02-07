@@ -8,7 +8,8 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { processImage, getFileSize, processImageToTargetSize } from '../utils/imageProcessing';
 import { processVideo, getVideoSize } from '../utils/videoProcessing';
 import AdBanner from '../components/AdBanner';
-import { RewardedAd, RewardedAdEventType, TestIds, RewardedAdType, AdEventType } from 'react-native-google-mobile-ads';
+import { RewardedAd, RewardedAdEventType, TestIds, AdEventType, BannerAd, BannerAdSize, AppOpenAd } from 'react-native-google-mobile-ads';
+import { AdConfig } from '../config/admob';
 
 const TARGET_SIZES = [
     { label: 'オリジナル', value: 0 },
@@ -28,6 +29,10 @@ export default function PhotoPressScreen() {
     const [fileName, setFileName] = useState<string>('');
     const [customFileNames, setCustomFileNames] = useState<{ [key: string]: string }>({});
     const [isPremium, setIsPremium] = useState(false);
+    const [loaded, setLoaded] = useState(false);
+    const [rewardedAd, setRewardedAd] = useState<RewardedAd | null>(null);
+    const [appOpenAd, setAppOpenAd] = useState<AppOpenAd | null>(null); // New state for App Open Ad
+    const [isAdRewardEarned, setIsAdRewardEarned] = useState(false);
 
     useEffect(() => {
         if (selectedImages.length > 0) {
@@ -47,6 +52,75 @@ export default function PhotoPressScreen() {
         }
     }, [selectedImages, selectedIndex, targetSize]);
 
+    useEffect(() => {
+        // Rewarded Ad
+        const ad = RewardedAd.createForAdRequest(AdConfig.rewardedAdUnitId, {
+            keywords: ['photo', 'camera'],
+        });
+
+        const unsubscribeLoaded = ad.addAdEventListener(RewardedAdEventType.LOADED, () => {
+            setLoaded(true);
+        });
+
+        const unsubscribeEarned = ad.addAdEventListener(
+            RewardedAdEventType.EARNED_REWARD,
+            reward => {
+                setIsAdRewardEarned(true);
+            },
+        );
+
+        const unsubscribeClosed = ad.addAdEventListener(
+            AdEventType.CLOSED,
+            () => {
+                setLoaded(false);
+                ad.load();
+            }
+        );
+
+        ad.load();
+        setRewardedAd(ad);
+
+        // App Open Ad Logic
+        const openAd = AppOpenAd.createForAdRequest(AdConfig.appOpenAdUnitId, {
+            requestNonPersonalizedAdsOnly: true,
+        });
+
+        const unsubscribeOpenLoaded = openAd.addAdEventListener(AdEventType.LOADED, () => {
+            // Show immediately when loaded if not premium
+            // Note: In a real app, you might check AppState to show only on resume
+            if (!isPremium) {
+                openAd.show();
+            }
+        });
+
+        const unsubscribeOpenClosed = openAd.addAdEventListener(AdEventType.CLOSED, () => {
+            // Reload or handle close? usually App Open Ad is one-off per session or resume
+            // For this simple implementation, we assume we might load it once on mount
+        });
+
+        // Load App Open Ad if not premium
+        if (!isPremium) {
+            openAd.load();
+            setAppOpenAd(openAd);
+        }
+
+        return () => {
+            unsubscribeLoaded();
+            unsubscribeEarned();
+            unsubscribeClosed();
+            unsubscribeOpenLoaded();
+            unsubscribeOpenClosed();
+        };
+    }, [isPremium]); // Re-run effect if premium status changes (to stop loading ads)
+
+    // Effect to handle save after ad reward is earned (ensures fresh state)
+    useEffect(() => {
+        if (isAdRewardEarned) {
+            performBatchSave();
+            setIsAdRewardEarned(false);
+        }
+    }, [isAdRewardEarned]);
+
     const generateDefaultFileName = (index: number) => {
         const now = new Date();
         const pad = (n: number) => n.toString().padStart(2, '0');
@@ -61,23 +135,37 @@ export default function PhotoPressScreen() {
             return;
         }
 
+        const limit = isPremium ? 30 : 10;
+        // Check current count
+        if (selectedImages.length >= limit) {
+            Alert.alert("制限到達", `一度に選択できる画像は${limit}枚までです。\nPremiumにアップグレードすると30枚まで選択できます。`);
+            return;
+        }
+
         try {
             const result = await ImagePicker.launchImageLibraryAsync({
                 mediaTypes: ImagePicker.MediaTypeOptions.All,
                 allowsEditing: false,
                 allowsMultipleSelection: true,
-                selectionLimit: 10,
+                selectionLimit: limit - selectedImages.length, // Remaining slots
                 quality: 1,
                 exif: true,
             });
 
             if (!result.canceled) {
-                // Append mode: Add new images to the existing list, avoiding duplicates
                 setSelectedImages(prevImages => {
                     const newImages = result.assets.filter(newAsset =>
                         !prevImages.some(existing => existing.uri === newAsset.uri || (existing.assetId && existing.assetId === newAsset.assetId))
                     );
-                    return [...prevImages, ...newImages];
+
+                    const totalImages = [...prevImages, ...newImages];
+
+                    if (totalImages.length > limit) {
+                        Alert.alert("制限超過", `${limit}枚を超えた分は除外されました。`);
+                        return totalImages.slice(0, limit);
+                    }
+
+                    return totalImages;
                 });
 
                 // If this was the first selection (list was empty), ensure index is 0. 
@@ -152,82 +240,60 @@ export default function PhotoPressScreen() {
 
     const handleSave = async () => {
         if (!processedImage) return;
-        try {
-            const { status } = await MediaLibrary.requestPermissionsAsync(true);
-            if (status !== 'granted') {
-                Alert.alert("権限が必要です", "画像を保存するには写真へのアクセス許可が必要です。");
-                return;
+
+        // Video Save - Check Premium/Ad
+        if (processedImage.type === 'video' && !isPremium) {
+            if (loaded && rewardedAd) {
+                Alert.alert(
+                    "Premium機能",
+                    "動画を保存するには広告を視聴してください。",
+                    [
+                        { text: "キャンセル", style: "cancel" },
+                        {
+                            text: "広告を消す (¥370)",
+                            onPress: handlePurchase
+                        },
+                        {
+                            text: "広告を見る",
+                            onPress: () => {
+                                setPendingAction('SINGLE_SAVE_VIDEO');
+                                setLoaded(false);
+                                rewardedAd.show();
+                            }
+                        }
+                    ]
+                );
+            } else {
+                Alert.alert("広告読み込み中", "広告を準備しています。少々お待ちください。");
             }
-
-            const extension = processedImage.uri.split('.').pop();
-            const newUri = FileSystem.cacheDirectory + fileName + '.' + extension;
-
-            await FileSystem.copyAsync({
-                from: processedImage.uri,
-                to: newUri
-            });
-
-            await MediaLibrary.saveToLibraryAsync(newUri);
-            Alert.alert("保存しました", `画像がアルバムに保存されました。\nファイル名: ${fileName}.${extension}`);
-        } catch (error) {
-            console.error(error);
-            Alert.alert("エラー", "画像の保存に失敗しました。");
+            return;
         }
+
+        performSingleSave();
     };
 
-    const [loaded, setLoaded] = useState(false);
-    const [rewardedAd, setRewardedAd] = useState<RewardedAdType | null>(null);
-    const [isAdRewardEarned, setIsAdRewardEarned] = useState(false);
+    const performSingleSave = async () => {
+        if (!processedImage) return;
 
-    useEffect(() => {
-        const ad = RewardedAd.createForAdRequest(TestIds.REWARDED, {
-            keywords: ['photo', 'camera'],
-        });
-
-        const unsubscribeLoaded = ad.addAdEventListener(RewardedAdEventType.LOADED, () => {
-            setLoaded(true);
-        });
-
-        const unsubscribeEarned = ad.addAdEventListener(
-            RewardedAdEventType.EARNED_REWARD,
-            reward => {
-                // User earned reward, set flag to trigger save in next render
-                setIsAdRewardEarned(true);
-            },
-        );
-
-        const unsubscribeClosed = ad.addAdEventListener(
-            AdEventType.CLOSED,
-            () => {
-                // Load next ad when current one is closed
-                setLoaded(false);
-                ad.load();
+        try {
+            const permission = await MediaLibrary.requestPermissionsAsync();
+            if (permission.granted) {
+                await MediaLibrary.saveToLibraryAsync(processedImage.uri);
+                Alert.alert("保存完了", "写真アプリに保存しました！");
+            } else {
+                Alert.alert("エラー", "写真へのアクセス権限がありません。");
             }
-        );
-
-        ad.load();
-        setRewardedAd(ad);
-
-        return () => {
-            unsubscribeLoaded();
-            unsubscribeEarned();
-            unsubscribeClosed();
-        };
-    }, []);
-
-    // Effect to handle save after ad reward is earned (ensures fresh state)
-    useEffect(() => {
-        if (isAdRewardEarned) {
-            performBatchSave();
-            setIsAdRewardEarned(false);
+        } catch (error) {
+            console.error(error);
+            Alert.alert("エラー", "保存に失敗しました。");
         }
-    }, [isAdRewardEarned]);
+    };
 
     const handleSaveAll = async () => {
         if (selectedImages.length === 0) return;
 
-        // Premium Check - For now, force ad every time for "Save All"
-        if (true) { // Always true for now as requested
+        // Premium Check
+        if (!isPremium) {
             if (loaded && rewardedAd) {
                 Alert.alert(
                     "Premium機能",
@@ -235,8 +301,13 @@ export default function PhotoPressScreen() {
                     [
                         { text: "キャンセル", style: "cancel" },
                         {
+                            text: "広告を消す (¥370)", // Mock IAP trigger
+                            onPress: handlePurchase
+                        },
+                        {
                             text: "広告を見る",
                             onPress: () => {
+                                setPendingAction('BATCH_SAVE');
                                 setLoaded(false); // Set loaded to false immediately when showing ad
                                 rewardedAd.show();
                             }
@@ -244,18 +315,29 @@ export default function PhotoPressScreen() {
                     ]
                 );
             } else {
-                Alert.alert("広告読み込み中", "広告を準備しています。少々お待ちください。", [
-                    {
-                        text: "OK", onPress: () => {
-                            // Check if loaded, otherwise wait
-                        }
-                    }
-                ]);
+                Alert.alert("広告読み込み中", "広告を準備しています。少々お待ちください。");
             }
             return;
         }
 
         performBatchSave();
+    };
+
+    const handlePurchase = () => {
+        Alert.alert(
+            "広告削除",
+            "370円で広告を削除しますか？ (テスト用: OKで購入済み状態になります)",
+            [
+                { text: "キャンセル", style: "cancel" },
+                {
+                    text: "購入する",
+                    onPress: () => {
+                        setIsPremium(true);
+                        Alert.alert("購入完了", "広告が削除されました！");
+                    }
+                }
+            ]
+        );
     };
 
     const performBatchSave = async () => {
@@ -334,8 +416,15 @@ export default function PhotoPressScreen() {
         <View style={styles.container}>
             <StatusBar style="auto" />
             <View style={styles.header}>
-                <Text style={styles.title}>PhotoPress</Text>
-                <Text style={styles.subtitle}>Exif削除 & 自動リサイズ</Text>
+                <View>
+                    <Text style={styles.title}>PhotoPress</Text>
+                    <Text style={styles.subtitle}>Exif削除 & 自動リサイズ</Text>
+                </View>
+                {!isPremium && (
+                    <TouchableOpacity style={styles.premiumButton} onPress={handlePurchase}>
+                        <Text style={styles.premiumButtonText}>🚫 広告削除</Text>
+                    </TouchableOpacity>
+                )}
             </View>
 
             <KeyboardAvoidingView
@@ -344,6 +433,7 @@ export default function PhotoPressScreen() {
                 keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
             >
                 <ScrollView contentContainerStyle={styles.content}>
+                    {!isPremium && <AdBanner unitId={AdConfig.bannerTopAdUnitId} />}
                     {selectedImages.length === 0 ? (
                         <TouchableOpacity style={styles.uploadButton} onPress={pickImage}>
                             <Text style={styles.uploadText}>写真を選択</Text>
@@ -351,6 +441,7 @@ export default function PhotoPressScreen() {
                         </TouchableOpacity>
                     ) : (
                         <View style={styles.previewContainer}>
+                            {/* ... existing content ... */}
                             {/* Thumbnail Strip */}
                             <ScrollView horizontal style={styles.thumbnailContainer} showsHorizontalScrollIndicator={false}>
                                 {selectedImages.map((img, index) => (
@@ -476,7 +567,9 @@ export default function PhotoPressScreen() {
                             {/* Batch Action Buttons */}
                             {selectedImages.length > 1 && !isProcessing && (
                                 <TouchableOpacity style={styles.saveAllButton} onPress={handleSaveAll}>
-                                    <Text style={styles.saveAllButtonText}>📸 まとめて保存 (Premium)</Text>
+                                    <Text style={styles.saveAllButtonText}>
+                                        {isPremium ? "📸 まとめて保存" : "📸 まとめて保存 (広告あり)"}
+                                    </Text>
                                 </TouchableOpacity>
                             )}
 
@@ -489,8 +582,8 @@ export default function PhotoPressScreen() {
                         </View>
                     )}
                 </ScrollView>
-                <AdBanner />
             </KeyboardAvoidingView>
+            {!isPremium && <AdBanner unitId={AdConfig.bannerBottomAdUnitId} />}
         </View>
     );
 }
@@ -507,6 +600,22 @@ const styles = StyleSheet.create({
         backgroundColor: '#fff',
         borderBottomWidth: 1,
         borderBottomColor: '#e1e1e1',
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+    },
+    premiumButton: {
+        backgroundColor: '#fff',
+        paddingVertical: 8,
+        paddingHorizontal: 12,
+        borderRadius: 20,
+        borderWidth: 1,
+        borderColor: '#8E44AD',
+    },
+    premiumButtonText: {
+        color: '#8E44AD',
+        fontSize: 12,
+        fontWeight: 'bold',
     },
     title: {
         fontSize: 24,
