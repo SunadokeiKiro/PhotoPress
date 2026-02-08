@@ -22,6 +22,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
       foregroundImage: "./assets/adaptive-icon.png",
       backgroundColor: "#ffffff"
     },
+    versionCode: 2,
     edgeToEdgeEnabled: true,
     predictiveBackGestureEnabled: false,
     permissions: [
